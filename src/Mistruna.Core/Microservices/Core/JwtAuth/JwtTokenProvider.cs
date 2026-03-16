@@ -23,14 +23,17 @@ public static class JwtTokenProvider
             new(JwtRegisteredClaimNames.Iat, DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString())
         };
 
-        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(AuthOptions.JwtKey));
+        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(AuthOptions.JwtKey))
+        {
+            KeyId = AuthOptions.JwtKeyId
+        };
         var signingCredentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 
         var expires = DateTime.Now.AddDays(30);
 
         var token = new JwtSecurityToken(
-            issuer: "Mistruna",
-            audience: "Mistruna",
+            issuer: AuthOptions.JwtIssuer,
+            audience: AuthOptions.JwtIssuer,
             claims: claims,
             notBefore: null,
             expires: expires,

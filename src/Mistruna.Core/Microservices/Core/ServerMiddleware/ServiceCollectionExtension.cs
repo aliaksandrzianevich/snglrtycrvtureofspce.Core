@@ -27,13 +27,19 @@ public static class ServiceCollectionExtension
             {
                 cfg.RequireHttpsMetadata = false;
                 cfg.SaveToken = true;
+                var signingKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(AuthOptions.JwtKey))
+                {
+                    KeyId = AuthOptions.JwtKeyId
+                };
+
                 cfg.TokenValidationParameters = new TokenValidationParameters
                 {
                     ValidIssuer = AuthOptions.JwtIssuer,
                     ValidAudience = AuthOptions.JwtIssuer,
-                    IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(AuthOptions.JwtKey)),
+                    IssuerSigningKey = signingKey,
                     ClockSkew = TimeSpan.Zero,
-                    RoleClaimType = "role"
+                    RoleClaimType = "role",
+                    TryAllIssuerSigningKeys = true
                 };
             });
 
