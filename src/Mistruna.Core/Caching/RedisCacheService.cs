@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Mistruna.Core.Contracts.Base.Infrastructure;
@@ -8,36 +9,21 @@ namespace Mistruna.Core.Caching;
 /// <summary>
 /// Redis-backed implementation of <see cref="ICacheService"/>.
 /// Uses StackExchange.Redis for distributed caching with JSON serialization.
+/// Includes double-check locking in <see cref="GetOrCreateAsync{T}"/> to prevent cache stampede.
 /// </summary>
-public sealed class RedisCacheService : ICacheService, IDisposable
+public sealed class RedisCacheService(
+    IConnectionMultiplexer connection,
+    ILogger<RedisCacheService> logger,
+    CacheOptions? options = null) : ICacheService
 {
-    private readonly IConnectionMultiplexer _connection;
-    private readonly IDatabase _database;
-    private readonly ILogger<RedisCacheService> _logger;
-    private readonly CacheOptions _options;
-    private readonly JsonSerializerOptions _jsonOptions;
-
-    /// <summary>
-    /// Initializes a new instance of the <see cref="RedisCacheService"/> class.
-    /// </summary>
-    /// <param name="connection">The Redis connection multiplexer.</param>
-    /// <param name="logger">The logger instance.</param>
-    /// <param name="options">Cache configuration options.</param>
-    public RedisCacheService(
-        IConnectionMultiplexer connection,
-        ILogger<RedisCacheService> logger,
-        CacheOptions? options = null)
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> Locks = new();
+    private readonly IDatabase _database = connection.GetDatabase();
+    private readonly CacheOptions _options = options ?? new CacheOptions();
+    private readonly JsonSerializerOptions _jsonOptions = new()
     {
-        _connection = connection;
-        _database = connection.GetDatabase();
-        _logger = logger;
-        _options = options ?? new CacheOptions();
-        _jsonOptions = new JsonSerializerOptions
-        {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-            PropertyNameCaseInsensitive = true
-        };
-    }
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true
+    };
 
     /// <inheritdoc />
     public async Task<T?> GetAsync<T>(string key, CancellationToken cancellationToken = default)
@@ -60,7 +46,7 @@ public sealed class RedisCacheService : ICacheService, IDisposable
         }
         catch (RedisException ex)
         {
-            _logger.LogError(ex, "Redis GET failed for key {Key}", prefixedKey);
+            logger.LogError(ex, "Redis GET failed for key {Key}", prefixedKey);
             return default;
         }
     }
@@ -82,7 +68,7 @@ public sealed class RedisCacheService : ICacheService, IDisposable
         }
         catch (RedisException ex)
         {
-            _logger.LogError(ex, "Redis SET failed for key {Key}", prefixedKey);
+            logger.LogError(ex, "Redis SET failed for key {Key}", prefixedKey);
         }
     }
 
@@ -94,18 +80,33 @@ public sealed class RedisCacheService : ICacheService, IDisposable
         CancellationToken cancellationToken = default)
     {
         var existing = await GetAsync<T>(key, cancellationToken);
-
         if (existing is not null)
             return existing;
 
-        var value = await factory();
+        var lockKey = GetPrefixedKey(key);
+        var semaphore = Locks.GetOrAdd(lockKey, _ => new SemaphoreSlim(1, 1));
 
-        if (value is not null)
+        await semaphore.WaitAsync(cancellationToken);
+        try
         {
-            await SetAsync(key, value, expiration, cancellationToken);
-        }
+            existing = await GetAsync<T>(key, cancellationToken);
+            if (existing is not null)
+            {
+                return existing;
+            }
 
-        return value;
+            var value = await factory();
+            if (value is not null)
+            {
+                await SetAsync(key, value, expiration, cancellationToken);
+            }
+
+            return value;
+        }
+        finally
+        {
+            semaphore.Release();
+        }
     }
 
     /// <inheritdoc />
@@ -119,7 +120,7 @@ public sealed class RedisCacheService : ICacheService, IDisposable
         }
         catch (RedisException ex)
         {
-            _logger.LogError(ex, "Redis DELETE failed for key {Key}", prefixedKey);
+            logger.LogError(ex, "Redis DELETE failed for key {Key}", prefixedKey);
         }
     }
 
@@ -130,12 +131,10 @@ public sealed class RedisCacheService : ICacheService, IDisposable
 
         try
         {
-            foreach (var endpoint in _connection.GetEndPoints())
+            foreach (var endpoint in connection.GetEndPoints())
             {
-                var server = _connection.GetServer(endpoint);
-                var keys = server.Keys(pattern: prefixedPattern);
-
-                foreach (var key in keys)
+                var server = connection.GetServer(endpoint);
+                foreach (var key in server.Keys(pattern: prefixedPattern))
                 {
                     await _database.KeyDeleteAsync(key);
                 }
@@ -143,7 +142,7 @@ public sealed class RedisCacheService : ICacheService, IDisposable
         }
         catch (RedisException ex)
         {
-            _logger.LogError(ex, "Redis REMOVE BY PATTERN failed for pattern {Pattern}", prefixedPattern);
+            logger.LogError(ex, "Redis REMOVE BY PATTERN failed for pattern {Pattern}", prefixedPattern);
         }
     }
 
@@ -158,7 +157,7 @@ public sealed class RedisCacheService : ICacheService, IDisposable
         }
         catch (RedisException ex)
         {
-            _logger.LogError(ex, "Redis EXISTS failed for key {Key}", prefixedKey);
+            logger.LogError(ex, "Redis EXISTS failed for key {Key}", prefixedKey);
             return false;
         }
     }
@@ -177,16 +176,8 @@ public sealed class RedisCacheService : ICacheService, IDisposable
         }
         catch (RedisException ex)
         {
-            _logger.LogError(ex, "Redis REFRESH failed for key {Key}", prefixedKey);
+            logger.LogError(ex, "Redis REFRESH failed for key {Key}", prefixedKey);
         }
-    }
-
-    /// <summary>
-    /// Disposes the Redis connection.
-    /// </summary>
-    public void Dispose()
-    {
-        _connection.Dispose();
     }
 
     private string GetPrefixedKey(string key) =>
